@@ -9,7 +9,7 @@ def main():
     parser.add_argument("cwd", help="Project directory")
     parser.add_argument("--task", required=True, help="Task description")
     parser.add_argument("--mode", default="build", help="Session mode (build/architect/plan)")
-    parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument("--timeout", type=int, default=0, help="Safety timeout in seconds (0 = no timeout, let agent finish)"
     parser.add_argument("--raw-log", default="/tmp/acp-raw.jsonl", help="Path for raw JSONL log")
     args = parser.parse_args()
 
@@ -81,10 +81,10 @@ def main():
     total_tokens = 0
     cost = "0"
 
-    deadline = time.time() + args.timeout
+    deadline = time.time() + args.timeout if args.timeout > 0 else float('inf')
     got_prompt_response = False
     while time.time() < deadline:
-        rlist, _, _ = select.select([proc.stdout], [], [], 2)
+        rlist, _, _ = select.select([proc.stdout], [], [], 5)
         if rlist:
             chunk = os.read(proc.stdout.fileno(), 65536)
             if not chunk: break
@@ -182,6 +182,7 @@ def main():
         "filesChanged": sorted(files_touched),
         "toolsUsed": tools_used,
         "tokensUsed": total_tokens,
+        "timeout": args.timeout or None,
         "cost": cost,
         "mode": args.mode,
         "response": full_text,
