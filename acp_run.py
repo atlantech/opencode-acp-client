@@ -12,237 +12,698 @@ Usage:
   # Turn 2 — reuses session:
   python3 acp_run.py /repo --session-id ses_abc --task "use arrow functions"
 """
-import json, subprocess, sys, os, time, select, argparse, re
+from __future__ import annotations
 
-OPENCODE = os.path.expanduser("~/.opencode/bin/opencode")
+import argparse
+import json
+import os
+import select
+import subprocess
+import sys
+import time
+from typing import Optional, Any
+
+OPENCODE_BINARY = os.path.expanduser("~/.opencode/bin/opencode")
+
+PROTOCOL_VERSION = 1
+CLIENT_NAME = "openclaw-acp"
+CLIENT_VERSION = "0.3"
+
+RAW_LOG_DEFAULT = "/tmp/acp-raw.jsonl"
+QUESTION_FILE_DEFAULT = "/tmp/acp-question.json"
+ANSWER_FILE_DEFAULT = "/tmp/acp-answer.json"
+
+CHUNK_SIZE = 65536
+SELECT_TIMEOUT = 5
+INITIALIZATION_TIMEOUT = 10
+SESSION_TIMEOUT = 30
+PROMPT_TIMEOUT = 10
+DRAIN_WAIT_TIME = 0.3
+DRAIN_ITERATIONS = 5
+TERMINATE_TIMEOUT = 5
+
+UPDATE_TYPE_AGENT_THOUGHT = "agent_thought_chunk"
+UPDATE_TYPE_AGENT_MESSAGE = "agent_message_chunk"
+UPDATE_TYPE_TOOL_CALL = "tool_call_update"
+UPDATE_TYPE_USAGE = "usage_update"
+
+TOOL_KIND_WRITE = "write"
+TOOL_KIND_EDIT = "edit"
+TOOL_KIND_READ = "read"
+TOOL_KIND_LIST = "list"
+TOOL_KIND_GLOB = "glob"
+TOOL_KIND_GREP = "grep"
+TOOL_KIND_TODOWRITE = "todowrite"
+TOOL_KIND_SKILL = "skill"
+
+SAFE_TOOLS = frozenset({
+    TOOL_KIND_READ, TOOL_KIND_LIST, TOOL_KIND_GLOB,
+    TOOL_KIND_GREP, TOOL_KIND_TODOWRITE, TOOL_KIND_SKILL
+})
+
+OPTION_ALLOW_ALWAYS = "allow_always"
+OPTION_ALLOW_ONCE = "allow_once"
+OPTION_REJECT_ONCE = "reject_once"
+
+APPROVE_ALL = "all"
+APPROVE_SAFE = "safe"
+APPROVE_NONE = "none"
+
+STATUS_DONE = "done"
+STATUS_ERROR = "error"
+STATUS_QUESTION = "question"
+STATUS_INCOMPLETE = "incomplete"
+
+REASON_END_TURN = "end_turn"
+
+MODE_BUILD = "build"
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("cwd", help="Project directory")
-    p.add_argument("--task", required=True)
-    p.add_argument("--session-id", default=None, help="Reuse existing session")
-    p.add_argument("--mode", default="build")
-    p.add_argument("--timeout", type=int, default=0, help="0 = unlimited")
-    p.add_argument("--raw-log", default="/tmp/acp-raw.jsonl")
-    p.add_argument("--question-file", default="/tmp/acp-question.json")
-    p.add_argument("--answer-file", default="/tmp/acp-answer.json")
-    p.add_argument("--approve", default="all", choices=["all", "none", "safe"])
-    p.add_argument("--opencode-bin", default=OPENCODE)
-    args = p.parse_args()
-
-    proc = subprocess.Popen(
-        [args.opencode_bin, "acp", "--cwd", args.cwd],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+def parse_arguments() -> argparse.Namespace:
+    """Parse command line arguments for the ACP client."""
+    parser = argparse.ArgumentParser(
+        description="ACP client for opencode: JSON-RPC over stdio"
     )
-    msg_id = 0
-    buf = b""
+    parser.add_argument("cwd", help="Project directory")
+    parser.add_argument("--task", required=True, help="Task to execute")
+    parser.add_argument(
+        "--session-id",
+        default=None,
+        help="Reuse existing session"
+    )
+    parser.add_argument("--mode", default=MODE_BUILD, help="Session mode")
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=0,
+        help="Timeout in seconds (0 = unlimited)"
+    )
+    parser.add_argument("--raw-log", default=RAW_LOG_DEFAULT, help="Path to raw log file")
+    parser.add_argument(
+        "--question-file",
+        default=QUESTION_FILE_DEFAULT,
+        help="Path to question file"
+    )
+    parser.add_argument(
+        "--answer-file",
+        default=ANSWER_FILE_DEFAULT,
+        help="Path to answer file"
+    )
+    parser.add_argument(
+        "--approve",
+        default=APPROVE_ALL,
+        choices=[APPROVE_ALL, APPROVE_NONE, APPROVE_SAFE],
+        help="Auto-approve policy"
+    )
+    parser.add_argument("--opencode-bin", default=OPENCODE_BINARY, help="Path to opencode binary")
+    return parser.parse_args()
 
-    def send(method, params):
-        nonlocal msg_id
-        msg_id += 1
-        m = {"jsonrpc": "2.0", "id": msg_id, "method": method, "params": params}
-        proc.stdin.write((json.dumps(m) + "\n").encode())
-        proc.stdin.flush()
-        return msg_id
 
-    def wait_for(tid, timeout=10):
-        nonlocal buf
+def determine_auto_approve(kind: str, options: list[dict], policy: str) -> str:
+    """
+    Determine which option to auto-approve based on policy.
+
+    Args:
+        kind: The tool call kind (e.g., 'read', 'write', 'edit').
+        options: List of available permission options.
+        policy: Approval policy ('all', 'safe', 'none').
+
+    Returns:
+        The optionId to approve.
+    """
+    if not options:
+        return OPTION_ALLOW_ONCE if policy == APPROVE_ALL else OPTION_REJECT_ONCE
+
+    if policy == APPROVE_ALL:
+        for pref in (OPTION_ALLOW_ALWAYS, OPTION_ALLOW_ONCE):
+            for option in options:
+                if option.get("kind") == pref:
+                    return option["optionId"]
+        return options[0]["optionId"]
+
+    if policy == APPROVE_SAFE:
+        if kind in SAFE_TOOLS:
+            for option in options:
+                if "allow" in option.get("kind", ""):
+                    return option["optionId"]
+        for option in options:
+            if option.get("kind") == OPTION_REJECT_ONCE:
+                return option["optionId"]
+        return options[0]["optionId"]
+
+    for option in options:
+        if option.get("kind") == OPTION_REJECT_ONCE:
+            return option["optionId"]
+    return options[0]["optionId"]
+
+
+def cleanup_process(proc: subprocess.Popen) -> None:
+    """Clean up the subprocess by closing stdin and terminating it gracefully."""
+    try:
+        proc.stdin.close()
+    except OSError:
+        pass
+    try:
+        proc.terminate()
+        proc.wait(timeout=TERMINATE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
+def is_question_tool(kind: str, options: list[dict]) -> bool:
+    """Determine if a tool call is a question that requires user interaction."""
+    question_kinds = frozenset({"question", "ask", "switch_mode"})
+    if kind in question_kinds:
+        return True
+    for option in options:
+        option_kind = option.get("kind", "")
+        if option_kind not in (
+            OPTION_ALLOW_ONCE, OPTION_ALLOW_ALWAYS,
+            OPTION_REJECT_ONCE, "reject_always"
+        ):
+            return True
+    return False
+
+
+def format_question(params: dict, cwd: str) -> dict:
+    """Format a question from permission request parameters."""
+    tool_call = params.get("toolCall", {})
+    options = params.get("options", [])
+    tool_kind = tool_call.get("kind", "")
+
+    content_parts = []
+    for item in tool_call.get("content", []):
+        if isinstance(item, dict):
+            content_parts.append(item.get("text", ""))
+        else:
+            content_parts.append(str(item))
+
+    return {
+        "type": "question",
+        "toolCallId": tool_call.get("toolCallId", ""),
+        "title": tool_call.get("title", ""),
+        "content": "\n".join(content_parts),
+        "options": [
+            {
+                "id": option.get("optionId"),
+                "name": option.get("name"),
+                "kind": option.get("kind")
+            }
+            for option in options
+        ],
+        "_kind": tool_kind
+    }
+
+
+def strip_cwd_prefix(path: str, cwd: str) -> str:
+    """Remove the cwd prefix from a file path."""
+    prefix = cwd.rstrip("/") + "/"
+    return path.replace(prefix, "", 1) if path.startswith(prefix) else path
+
+
+class ACPClient:
+    """
+    ACP (Agent Communication Protocol) client for opencode.
+
+    Handles JSON-RPC communication over stdio with the opencode process,
+    including session management, tool call permissions, and response streaming.
+    """
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        """
+        Initialize the ACP client.
+
+        Args:
+            args: Parsed command line arguments.
+        """
+        self.args = args
+        self.process: Optional[subprocess.Popen] = None
+        self.message_id = 0
+        self.buffer = b""
+        self.raw_log_file: Optional[Any] = None
+        self.session_id: Optional[str] = None
+
+        self.files_touched: set[str] = set()
+        self.tools_used: list[str] = []
+        self.text_parts: list[str] = []
+        self.stop_reason: Optional[str] = None
+        self.tokens_used = 0
+        self.cost = "0"
+
+    def _send_message(self, method: str, params: dict) -> int:
+        """
+        Send a JSON-RPC message to the opencode process.
+
+        Args:
+            method: The RPC method name.
+            params: The method parameters.
+
+        Returns:
+            The message ID assigned to this message.
+        """
+        self.message_id += 1
+        message = {
+            "jsonrpc": "2.0",
+            "id": self.message_id,
+            "method": method,
+            "params": params
+        }
+        self.process.stdin.write((json.dumps(message) + "\n").encode())
+        self.process.stdin.flush()
+        return self.message_id
+
+    def _wait_for_response(self, message_id: int, timeout: float = 10) -> Optional[dict]:
+        """
+        Wait for a response with a specific message ID.
+
+        Args:
+            message_id: The message ID to wait for.
+            timeout: Maximum time to wait in seconds.
+
+        Returns:
+            The response object, or None if timeout occurred.
+        """
         deadline = time.time() + timeout
         while time.time() < deadline:
-            r, _, _ = select.select([proc.stdout], [], [], 1)
-            if r:
-                chunk = os.read(proc.stdout.fileno(), 65536)
-                if not chunk: break
-                buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    line = line.strip()
-                    if not line: continue
-                    raw_log.write(line.decode(errors="replace") + "\n")
-                    raw_log.flush()
-                    try:
-                        obj = json.loads(line)
-                        if obj.get("id") == tid: return obj
-                    except: pass
+            read_ready, _, _ = select.select([self.process.stdout], [], [], 1)
+            if not read_ready:
+                continue
+
+            chunk = os.read(self.process.stdout.fileno(), CHUNK_SIZE)
+            if not chunk:
+                break
+
+            self.buffer += chunk
+            while b"\n" in self.buffer:
+                line, self.buffer = self.buffer.split(b"\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+
+                self.raw_log_file.write(line.decode(errors="replace") + "\n")
+                self.raw_log_file.flush()
+
+                try:
+                    response = json.loads(line)
+                    if response.get("id") == message_id:
+                        return response
+                except json.JSONDecodeError:
+                    pass
         return None
 
-    raw_log = open(args.raw_log, "a" if args.session_id else "w")
+    def _read_available_messages(self) -> list[dict]:
+        """
+        Read all available messages from stdout without blocking.
 
-    # Init
-    send("initialize", {"protocolVersion": 1, "capabilities": {},
-             "clientInfo": {"name": "openclaw-acp", "version": "0.3"}})
-    if not wait_for(1, 10):
-        raw_log.close(); proc.kill()
-        print(json.dumps({"status": "error", "error": "initialize failed"})); sys.exit(1)
+        Returns:
+            List of parsed JSON objects.
+        """
+        messages = []
+        while True:
+            ready, _, _ = select.select([self.process.stdout], [], [], 0.1)
+            if not ready:
+                break
 
-    # Session
-    if args.session_id:
-        sid = args.session_id
-        send("session/load", {"sessionId": sid, "cwd": args.cwd, "mcpServers": []})
-        resp = wait_for(2, 30)  # may replay history, give more time
-        if not resp or "error" in resp:
-            raw_log.close(); proc.kill()
-            print(json.dumps({"status": "error", "error": f"session/load failed: {resp}"})); sys.exit(1)
-        sid = resp["result"]["sessionId"]
-    else:
-        send("session/new", {"cwd": args.cwd, "mcpServers": []})
-        resp = wait_for(2, 10)
-        if not resp or "error" in resp:
-            raw_log.close(); proc.kill()
-            print(json.dumps({"status": "error", "error": f"session/new failed: {resp}"})); sys.exit(1)
-        sid = resp["result"]["sessionId"]
-        # Set mode
-        if args.mode != "build":
-            send("session/set_mode", {"sessionId": sid, "modeId": args.mode})
-            wait_for(3, 10)
+            chunk = os.read(self.process.stdout.fileno(), CHUNK_SIZE)
+            if not chunk:
+                break
 
-    # Prompt
-    pid = send("session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": args.task}]})
+            self.buffer += chunk
+            while b"\n" in self.buffer:
+                line, self.buffer = self.buffer.split(b"\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
 
-    # Event loop
-    files_touched = set()
-    tools_used = []
-    text_parts = []
-    stop_reason = None
-    tokens = 0
-    cost = "0"
-    deadline = time.time() + args.timeout if args.timeout > 0 else float('inf')
-    got_response = False
+                self.raw_log_file.write(line.decode(errors="replace") + "\n")
+                self.raw_log_file.flush()
 
-    while time.time() < deadline and not got_response:
-        r, _, _ = select.select([proc.stdout], [], [], 5)
-        if not r: continue
-        chunk = os.read(proc.stdout.fileno(), 65536)
-        if not chunk: break
-        buf += chunk
-        while b"\n" in buf:
-            line, buf = buf.split(b"\n", 1)
-            line = line.strip()
-            if not line: continue
-            raw_log.write(line.decode(errors="replace") + "\n")
-            raw_log.flush()
-            try: obj = json.loads(line)
-            except: continue
+                try:
+                    messages.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+        return messages
 
-            method = obj.get("method", "")
-            params = obj.get("params", {})
-            upd = params.get("update", {})
-            ut = upd.get("sessionUpdate", "")
+    def _start_process(self) -> None:
+        """Start the opencode subprocess."""
+        self.process = subprocess.Popen(
+            [self.args.opencode_bin, "acp", "--cwd", self.args.cwd],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
 
-            # Streaming text
-            if ut in ("agent_thought_chunk", "agent_message_chunk"):
-                c = upd.get("content", {})
-                t = c.get("text", "") if isinstance(c, dict) else ""
-                if t: text_parts.append(t)
+    def _initialize(self) -> None:
+        """Initialize the ACP connection."""
+        self._send_message(
+            "initialize",
+            {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION}
+            }
+        )
+        response = self._wait_for_response(1, INITIALIZATION_TIMEOUT)
+        if not response:
+            cleanup_process(self.process)
+            print(json.dumps({
+                "status": STATUS_ERROR,
+                "error": "initialize failed: no response from server"
+            }))
+            sys.exit(1)
 
-            # Tool calls
-            elif ut == "tool_call_update":
-                kind = upd.get("kind", "")
-                status = upd.get("status", "")
-                for loc in (upd.get("locations") or []):
-                    path = loc.get("path", "")
-                    if path:
-                        rel = path.replace(args.cwd + "/", "")
-                        files_touched.add(rel) if kind in ("write", "edit") else files_touched.discard(rel)
-                if status == "completed" and upd.get("rawInput"):
-                    ri = upd["rawInput"]
-                    for k in ("filePath", "path"):
-                        pv = ri.get(k, "")
-                        if pv and kind in ("write", "edit"):
-                            files_touched.add(pv.replace(args.cwd + "/", ""))
-                    tools_used.append(ri.get("description", upd.get("title", "")))
+        if "error" in response:
+            cleanup_process(self.process)
+            print(json.dumps({
+                "status": STATUS_ERROR,
+                "error": f"initialize failed: {response['error']}"
+            }))
+            sys.exit(1)
 
-            # Usage
-            elif ut == "usage_update":
-                tokens = upd.get("used", tokens)
-                ci = upd.get("cost", {})
-                cost = ci.get("amount", cost)
+    def _load_or_create_session(self) -> str:
+        """
+        Load an existing session or create a new one.
 
-            # Permission / question
-            elif method == "session/request_permission":
-                tc = params.get("toolCall", {})
-                tc_id = tc.get("toolCallId", "")
-                tc_kind = tc.get("kind", "")
-                options = params.get("options", [])
-                is_q = tc_kind in ("question", "ask", "switch_mode") or \
-                       any(o.get("kind") not in ("allow_once","allow_always","reject_once","reject_always") for o in options)
+        Returns:
+            The session ID.
+        """
+        if self.args.session_id:
+            return self._load_session()
+        return self._create_session()
 
-                if is_q:
-                    question = {"type": "question", "toolCallId": tc_id,
-                                "title": tc.get("title", ""),
-                                "content": "\n".join(c.get("text","") if isinstance(c,dict) else str(c) for c in tc.get("content",[])),
-                                "options": [{"id": o.get("optionId"), "name": o.get("name"), "kind": o.get("kind")} for o in options]}
-                    with open(args.question_file, "w") as f:
-                        json.dump(question, f, indent=2, ensure_ascii=False)
-                    try: os.unlink(args.answer_file)
-                    except: pass
-                    cleanup(proc); raw_log.close()
-                    print(json.dumps({"status": "question", "sessionId": sid, "question": question,
-                                      "filesChanged": sorted(files_touched), "response": "".join(text_parts),
-                                      "rawLog": args.raw_log}, ensure_ascii=False))
-                    return
+    def _load_session(self) -> str:
+        """Load an existing session by ID."""
+        self._send_message(
+            "session/load",
+            {
+                "sessionId": self.args.session_id,
+                "cwd": self.args.cwd,
+                "mcpServers": []
+            }
+        )
+        response = self._wait_for_response(2, SESSION_TIMEOUT)
+        if not response or "error" in response:
+            cleanup_process(self.process)
+            print(json.dumps({
+                "status": STATUS_ERROR,
+                "error": f"session/load failed: {response}"
+            }))
+            sys.exit(1)
+        return response["result"]["sessionId"]
+
+    def _create_session(self) -> str:
+        """Create a new session."""
+        self._send_message(
+            "session/new",
+            {"cwd": self.args.cwd, "mcpServers": []}
+        )
+        response = self._wait_for_response(2, PROMPT_TIMEOUT)
+        if not response or "error" in response:
+            cleanup_process(self.process)
+            print(json.dumps({
+                "status": STATUS_ERROR,
+                "error": f"session/new failed: {response}"
+            }))
+            sys.exit(1)
+
+        session_id = response["result"]["sessionId"]
+
+        if self.args.mode != MODE_BUILD:
+            self._send_message(
+                "session/set_mode",
+                {"sessionId": session_id, "modeId": self.args.mode}
+            )
+            self._wait_for_response(3, PROMPT_TIMEOUT)
+
+        return session_id
+
+    def _submit_prompt(self) -> int:
+        """
+        Submit the task prompt.
+
+        Returns:
+            The message ID of the prompt request.
+        """
+        return self._send_message(
+            "session/prompt",
+            {
+                "sessionId": self.session_id,
+                "prompt": [{"type": "text", "text": self.args.task}]
+            }
+        )
+
+    def _process_update(self, update_type: str, update_data: dict) -> bool:
+        """
+        Process a session update.
+
+        Args:
+            update_type: The type of update.
+            update_data: The update data.
+
+        Returns:
+            True if the update was handled, False if it should be processed further.
+        """
+        if update_type in (UPDATE_TYPE_AGENT_THOUGHT, UPDATE_TYPE_AGENT_MESSAGE):
+            self._process_text_chunk(update_data)
+            return True
+
+        if update_type == UPDATE_TYPE_TOOL_CALL:
+            self._process_tool_update(update_data)
+            return True
+
+        if update_type == UPDATE_TYPE_USAGE:
+            self._process_usage_update(update_data)
+            return True
+
+        return False
+
+    def _process_text_chunk(self, update_data: dict) -> None:
+        """Process a text chunk from the agent."""
+        content = update_data.get("content", {})
+        if isinstance(content, dict):
+            text = content.get("text", "")
+            if text:
+                self.text_parts.append(text)
+
+    def _process_tool_update(self, update_data: dict) -> None:
+        """Process a tool call update."""
+        tool_kind = update_data.get("kind", "")
+        tool_status = update_data.get("status", "")
+
+        locations = update_data.get("locations") or []
+        for location in locations:
+            path = location.get("path", "")
+            if path:
+                relative_path = strip_cwd_prefix(path, self.args.cwd)
+                if tool_kind in (TOOL_KIND_WRITE, TOOL_KIND_EDIT):
+                    self.files_touched.add(relative_path)
                 else:
-                    chosen = auto_approve(tc_kind, options, args.approve)
-                    msg_id += 1
-                    proc.stdin.write((json.dumps({"jsonrpc":"2.0","id":msg_id,"method":"session/permission_response",
-                        "params":{"sessionId":sid,"toolCallId":tc_id,"optionId":chosen}}) + "\n").encode())
-                    proc.stdin.flush()
+                    self.files_touched.discard(relative_path)
 
-            # Final response
-            elif obj.get("id") == pid:
-                res = obj.get("result", {})
-                stop_reason = res.get("stopReason")
-                tokens = res.get("usage", {}).get("totalTokens", tokens)
-                t = res.get("text", "")
-                if t: text_parts.append(t)
-                got_response = True
+        if tool_status == "completed" and update_data.get("rawInput"):
+            raw_input = update_data["rawInput"]
+            for key in ("filePath", "path"):
+                file_path = raw_input.get(key, "")
+                if file_path and tool_kind in (TOOL_KIND_WRITE, TOOL_KIND_EDIT):
+                    self.files_touched.add(strip_cwd_prefix(file_path, self.args.cwd))
 
-    # Drain
-    time.sleep(0.3)
-    for _ in range(5):
-        r, _, _ = select.select([proc.stdout], [], [], 0.2)
-        if not r: break
-        c = os.read(proc.stdout.fileno(), 65536)
-        if not c: break
-        for ln in c.split(b"\n"):
-            if ln.strip(): raw_log.write(ln.decode(errors="replace") + "\n")
+            description = raw_input.get(
+                "description",
+                update_data.get("title", "")
+            )
+            if description:
+                self.tools_used.append(description)
 
-    cleanup(proc); raw_log.close()
-    print(json.dumps({"status": "done" if stop_reason == "end_turn" else "incomplete",
-        "stopReason": stop_reason, "sessionId": sid,
-        "filesChanged": sorted(files_touched), "toolsUsed": tools_used,
-        "tokensUsed": tokens, "cost": cost, "mode": args.mode,
-        "response": "".join(text_parts), "rawLog": args.raw_log}, ensure_ascii=False))
+    def _process_usage_update(self, update_data: dict) -> None:
+        """Process a usage/cost update."""
+        self.tokens_used = update_data.get("used", self.tokens_used)
+        cost_info = update_data.get("cost", {})
+        self.cost = cost_info.get("amount", self.cost)
+
+    def _handle_permission_request(self, params: dict) -> bool:
+        """
+        Handle a permission request from the server.
+
+        Args:
+            params: The request parameters.
+
+        Returns:
+            True if question was handled (exited), False otherwise.
+        """
+        tool_call = params.get("toolCall", {})
+        tool_call_id = tool_call.get("toolCallId", "")
+        tool_kind = tool_call.get("kind", "")
+        options = params.get("options", [])
+
+        if is_question_tool(tool_kind, options):
+            question = format_question(params, self.args.cwd)
+
+            with open(self.args.question_file, "w") as f:
+                json.dump(question, f, indent=2, ensure_ascii=False)
+
+            try:
+                os.unlink(self.args.answer_file)
+            except OSError:
+                pass
+
+            cleanup_process(self.process)
+            self.raw_log_file.close()
+
+            result = {
+                "status": STATUS_QUESTION,
+                "sessionId": self.session_id,
+                "question": question,
+                "filesChanged": sorted(self.files_touched),
+                "response": "".join(self.text_parts),
+                "rawLog": self.args.raw_log
+            }
+            print(json.dumps(result, ensure_ascii=False))
+            return True
+
+        chosen_option = determine_auto_approve(tool_kind, options, self.args.approve)
+        self.message_id += 1
+
+        response_message = {
+            "jsonrpc": "2.0",
+            "id": self.message_id,
+            "method": "session/permission_response",
+            "params": {
+                "sessionId": self.session_id,
+                "toolCallId": tool_call_id,
+                "optionId": chosen_option
+            }
+        }
+        self.process.stdin.write((json.dumps(response_message) + "\n").encode())
+        self.process.stdin.flush()
+        return False
+
+    def _process_response(self, result: dict) -> bool:
+        """
+        Process a method response.
+
+        Args:
+            result: The response result.
+
+        Returns:
+            True if processing should stop, False otherwise.
+        """
+        self.stop_reason = result.get("stopReason")
+
+        usage = result.get("usage", {})
+        if usage:
+            self.tokens_used = usage.get("totalTokens", self.tokens_used)
+
+        response_text = result.get("text", "")
+        if response_text:
+            self.text_parts.append(response_text)
+
+        return True
+
+    def _drain_output(self) -> None:
+        """Drain any remaining output from the process."""
+        time.sleep(DRAIN_WAIT_TIME)
+        for _ in range(DRAIN_ITERATIONS):
+            ready, _, _ = select.select([self.process.stdout], [], [], 0.2)
+            if not ready:
+                break
+
+            chunk = os.read(self.process.stdout.fileno(), CHUNK_SIZE)
+            if not chunk:
+                break
+
+            for line in chunk.split(b"\n"):
+                if line.strip():
+                    self.raw_log_file.write(line.decode(errors="replace") + "\n")
+
+    def run(self) -> None:
+        """Run the ACP client main loop."""
+        self._start_process()
+        self.raw_log_file = open(
+            self.args.raw_log,
+            "a" if self.args.session_id else "w"
+        )
+
+        self._initialize()
+        self.session_id = self._load_or_create_session()
+        prompt_id = self._submit_prompt()
+
+        deadline = (
+            time.time() + self.args.timeout
+            if self.args.timeout > 0
+            else float("inf")
+        )
+        got_response = False
+
+        while time.time() < deadline and not got_response:
+            ready, _, _ = select.select([self.process.stdout], [], [], SELECT_TIMEOUT)
+            if not ready:
+                continue
+
+            chunk = os.read(self.process.stdout.fileno(), CHUNK_SIZE)
+            if not chunk:
+                break
+
+            self.buffer += chunk
+            while b"\n" in self.buffer:
+                line, self.buffer = self.buffer.split(b"\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+
+                self.raw_log_file.write(line.decode(errors="replace") + "\n")
+                self.raw_log_file.flush()
+
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if message.get("method") == "session/request_permission":
+                    if self._handle_permission_request(message.get("params", {})):
+                        return
+                    continue
+
+                if message.get("id") == prompt_id:
+                    if "result" in message:
+                        self._process_response(message["result"])
+                        got_response = True
+                    continue
+
+                params = message.get("params", {})
+                update_type = params.get("update", {}).get("sessionUpdate", "")
+                update_data = params.get("update", {})
+                self._process_update(update_type, update_data)
+
+        self._drain_output()
+        cleanup_process(self.process)
+        self.raw_log_file.close()
+
+        status = STATUS_DONE if self.stop_reason == REASON_END_TURN else STATUS_INCOMPLETE
+        result = {
+            "status": status,
+            "stopReason": self.stop_reason,
+            "sessionId": self.session_id,
+            "filesChanged": sorted(self.files_touched),
+            "toolsUsed": self.tools_used,
+            "tokensUsed": self.tokens_used,
+            "cost": self.cost,
+            "mode": self.args.mode,
+            "response": "".join(self.text_parts),
+            "rawLog": self.args.raw_log
+        }
+        print(json.dumps(result, ensure_ascii=False))
 
 
-def auto_approve(kind, options, policy):
-    if policy == "all":
-        for pref in ("allow_always", "allow_once"):
-            for o in options:
-                if o.get("kind") == pref: return o["optionId"]
-        return options[0]["optionId"] if options else "allow"
-    elif policy == "safe":
-        if kind in ("read","list","glob","grep","todowrite","skill"):
-            for o in options:
-                if "allow" in o.get("kind",""): return o["optionId"]
-        for o in options:
-            if o.get("kind") == "reject_once": return o["optionId"]
-        return options[0]["optionId"] if options else "reject"
-    else:
-        for o in options:
-            if o.get("kind") == "reject_once": return o["optionId"]
-        return options[0]["optionId"] if options else "reject"
-
-
-def cleanup(proc):
-    try: proc.stdin.close()
-    except: pass
-    try:
-        proc.terminate(); proc.wait(timeout=5)
-    except:
-        try: proc.kill()
-        except: pass
+def main() -> None:
+    """Main entry point for the ACP client."""
+    args = parse_arguments()
+    client = ACPClient(args)
+    client.run()
 
 
 if __name__ == "__main__":
