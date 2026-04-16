@@ -378,7 +378,7 @@ class ACPClient:
         deadline = time.time() + timeout
         empty_retries = 0
         while time.time() < deadline:
-            read_ready, _, _ = select.select([self.process.stdout], [], [], 1)
+            read_ready, _, _ = select.select([self.process.stdout.fileno()], [], [], 1)
             if not read_ready:
                 continue
 
@@ -520,37 +520,18 @@ class ACPClient:
 
     def _submit_prompt(self) -> int:
         """
-        Submit the task prompt with retry logic.
+        Submit the task prompt.
 
         Returns:
             The message ID of the prompt request.
         """
-        last_error = None
-        for attempt in range(MAX_RETRIES):
-            msg_id = self._send_message(
-                "session/prompt",
-                {
-                    "sessionId": self.session_id,
-                    "prompt": [{"type": "text", "text": self.args.task}]
-                }
-            )
-            response = self._wait_for_response(msg_id, PROMPT_TIMEOUT)
-            if response:
-                if "error" not in response:
-                    return msg_id
-                last_error = response["error"]
-            else:
-                last_error = "no response"
-
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_BASE_DELAY * (attempt + 1))
-
-        cleanup_process(self.process)
-        print(json.dumps({
-            "status": STATUS_ERROR,
-            "error": f"session/prompt failed: {last_error}"
-        }))
-        sys.exit(1)
+        return self._send_message(
+            "session/prompt",
+            {
+                "sessionId": self.session_id,
+                "prompt": [{"type": "text", "text": self.args.task}]
+            }
+        )
 
     def _process_update(self, update_type: str, update_data: dict) -> bool:
         """
@@ -710,7 +691,7 @@ class ACPClient:
         """Drain any remaining output from the process."""
         time.sleep(DRAIN_WAIT_TIME)
         for _ in range(DRAIN_ITERATIONS):
-            ready, _, _ = select.select([self.process.stdout], [], [], 0.2)
+            ready, _, _ = select.select([self.process.stdout.fileno()], [], [], DRAIN_WAIT_TIME)
             if not ready:
                 break
 
@@ -746,7 +727,7 @@ class ACPClient:
         got_response = False
 
         while time.time() < deadline and not got_response:
-            ready, _, _ = select.select([self.process.stdout], [], [], SELECT_TIMEOUT)
+            ready, _, _ = select.select([self.process.stdout.fileno()], [], [], SELECT_TIMEOUT)
             if not ready:
                 continue
 
