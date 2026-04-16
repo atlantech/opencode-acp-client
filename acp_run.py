@@ -577,6 +577,11 @@ class ACPClient:
 
         return False
 
+    def _log_progress(self, msg: str) -> None:
+        """Write a progress line to stderr for the caller to monitor."""
+        sys.stderr.write(f"[acp] {msg}\n")
+        sys.stderr.flush()
+
     def _process_text_chunk(self, update_data: dict) -> None:
         """Process a text chunk from the agent."""
         content = update_data.get("content", {})
@@ -589,6 +594,10 @@ class ACPClient:
         """Process a tool call update."""
         tool_kind = update_data.get("kind", "")
         tool_status = update_data.get("status", "")
+        tool_title = update_data.get("title", tool_kind)
+
+        if tool_status == "started":
+            self._log_progress(f"tool started: {tool_title}")
 
         locations = update_data.get("locations") or []
         for location in locations:
@@ -614,11 +623,15 @@ class ACPClient:
             if description:
                 self.tools_used.append(description)
 
+        if tool_status == "completed":
+            self._log_progress(f"tool done: {tool_title}")
+
     def _process_usage_update(self, update_data: dict) -> None:
         """Process a usage/cost update."""
         self.tokens_used = update_data.get("used", self.tokens_used)
         cost_info = update_data.get("cost", {})
         self.cost = cost_info.get("amount", self.cost)
+        self._log_progress(f"tokens: {self.tokens_used}, cost: {self.cost}")
 
     def _handle_permission_request(self, params: dict) -> bool:
         """
@@ -717,9 +730,13 @@ class ACPClient:
             "a" if self.args.session_id else "w"
         )
 
+        self._log_progress("initializing opencode...")
         self._initialize()
+        self._log_progress(f"initialized, session: {self.session_id or 'creating...'}")
         self.session_id = self._load_or_create_session()
+        self._log_progress(f"session: {self.session_id}")
         prompt_id = self._submit_prompt()
+        self._log_progress("task submitted, waiting for response...")
 
         deadline = (
             time.time() + self.args.timeout
@@ -767,6 +784,7 @@ class ACPClient:
         cleanup_process(self.process)
         self.raw_log_file.close()
 
+        self._log_progress(f"finished: {self.stop_reason}")
         status = STATUS_DONE if self.stop_reason == REASON_END_TURN else STATUS_INCOMPLETE
         result = {
             "status": status,
