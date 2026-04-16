@@ -2,6 +2,8 @@
 
 JSON-RPC over stdio client for [opencode](https://github.com/opencode-ai/opencode), enabling agent-driven coding sessions with multi-turn support, auto-approve, and permission handling.
 
+> **Note:** This repo was created as a workaround for OpenClaw's ACP communication with opencode.
+
 ## Features
 
 - **Multi-turn conversations** — reuse sessions via `--session-id`, powered by opencode's `session/load`
