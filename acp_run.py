@@ -544,8 +544,12 @@ class ACPClient:
         Returns:
             True if the update was handled, False if it should be processed further.
         """
-        if update_type in (UPDATE_TYPE_AGENT_THOUGHT, UPDATE_TYPE_AGENT_MESSAGE):
+        if update_type == UPDATE_TYPE_AGENT_MESSAGE:
             self._process_text_chunk(update_data)
+            return True
+
+        if update_type == UPDATE_TYPE_AGENT_THOUGHT:
+            # Skip reasoning to save tokens in final output
             return True
 
         if update_type == UPDATE_TYPE_TOOL_CALL:
