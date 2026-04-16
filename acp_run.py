@@ -15,11 +15,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import select
+import signal
 import subprocess
 import sys
+import threading
 import time
 from typing import Optional, Any
 
@@ -41,6 +44,10 @@ PROMPT_TIMEOUT = 10
 DRAIN_WAIT_TIME = 0.3
 DRAIN_ITERATIONS = 5
 TERMINATE_TIMEOUT = 5
+MAX_BUFFER_SIZE = 10 * 1024 * 1024
+MAX_EMPTY_RETRIES = 5
+RETRY_BASE_DELAY = 1.0
+MAX_RETRIES = 3
 
 UPDATE_TYPE_AGENT_THOUGHT = "agent_thought_chunk"
 UPDATE_TYPE_AGENT_MESSAGE = "agent_message_chunk"
@@ -77,6 +84,8 @@ STATUS_INCOMPLETE = "incomplete"
 REASON_END_TURN = "end_turn"
 
 MODE_BUILD = "build"
+
+_client_instance: Optional["ACPClient"] = None
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -157,8 +166,10 @@ def determine_auto_approve(kind: str, options: list[dict], policy: str) -> str:
     return options[0]["optionId"]
 
 
-def cleanup_process(proc: subprocess.Popen) -> None:
+def cleanup_process(proc: Optional[subprocess.Popen]) -> None:
     """Clean up the subprocess by closing stdin and terminating it gracefully."""
+    if proc is None:
+        return
     try:
         proc.stdin.close()
     except OSError:
@@ -173,6 +184,19 @@ def cleanup_process(proc: subprocess.Popen) -> None:
             pass
     except OSError:
         pass
+
+
+def _signal_handler(signum: int, frame: Any) -> None:
+    """Handle SIGTERM/SIGINT signals to clean up the subprocess."""
+    global _client_instance
+    if _client_instance:
+        cleanup_process(_client_instance.process)
+        if _client_instance.raw_log_file:
+            try:
+                _client_instance.raw_log_file.close()
+            except OSError:
+                pass
+    sys.exit(128 + signum)
 
 
 def is_question_tool(kind: str, options: list[dict]) -> bool:
@@ -241,6 +265,9 @@ class ACPClient:
         Args:
             args: Parsed command line arguments.
         """
+        global _client_instance
+        _client_instance = self
+
         self.args = args
         self.process: Optional[subprocess.Popen] = None
         self.message_id = 0
@@ -254,6 +281,35 @@ class ACPClient:
         self.stop_reason: Optional[str] = None
         self.tokens_used = 0
         self.cost = "0"
+
+        self._stderr_thread: Optional[threading.Thread] = None
+        self._stderr_done = threading.Event()
+
+        signal.signal(signal.SIGTERM, _signal_handler)
+        signal.signal(signal.SIGINT, _signal_handler)
+        atexit.register(self._atexit_cleanup)
+
+    def _atexit_cleanup(self) -> None:
+        """Clean up on exit via atexit."""
+        cleanup_process(self.process)
+        if self.raw_log_file:
+            try:
+                self.raw_log_file.close()
+            except OSError:
+                pass
+
+    def _stderr_reader(self) -> None:
+        """Read and discard stderr in a separate thread to prevent deadlock."""
+        try:
+            while not self._stderr_done.is_set():
+                try:
+                    chunk = os.read(self.process.stderr.fileno(), CHUNK_SIZE)
+                    if not chunk:
+                        break
+                except OSError:
+                    break
+        finally:
+            self._stderr_done.set()
 
     def _send_message(self, method: str, params: dict) -> int:
         """
@@ -273,9 +329,40 @@ class ACPClient:
             "method": method,
             "params": params
         }
-        self.process.stdin.write((json.dumps(message) + "\n").encode())
-        self.process.stdin.flush()
+        try:
+            self.process.stdin.write((json.dumps(message) + "\n").encode())
+            self.process.stdin.flush()
+        except BrokenPipeError:
+            pass
         return self.message_id
+
+    def _parse_buffer(self) -> list[tuple[bytes, dict]]:
+        """
+        Parse complete JSON messages from buffer, handling partial reads.
+
+        Returns:
+            List of (raw_line, parsed) tuples for complete messages.
+        """
+        complete_messages = []
+        while b"\n" in self.buffer:
+            line, self.buffer = self.buffer.split(b"\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+
+            if len(self.buffer) > MAX_BUFFER_SIZE:
+                sys.stderr.write(f"Buffer exceeded max size, truncating\n")
+                self.buffer = self.buffer[-CHUNK_SIZE:]
+
+            try:
+                msg = json.loads(line)
+                complete_messages.append((line, msg))
+            except json.JSONDecodeError as e:
+                sys.stderr.write(
+                    f"JSON decode error: {e.msg} at position {e.pos}, "
+                    f"raw: {line[:200]!r}\n"
+                )
+        return complete_messages
 
     def _wait_for_response(self, message_id: int, timeout: float = 10) -> Optional[dict]:
         """
@@ -289,6 +376,7 @@ class ACPClient:
             The response object, or None if timeout occurred.
         """
         deadline = time.time() + timeout
+        empty_retries = 0
         while time.time() < deadline:
             read_ready, _, _ = select.select([self.process.stdout], [], [], 1)
             if not read_ready:
@@ -296,58 +384,17 @@ class ACPClient:
 
             chunk = os.read(self.process.stdout.fileno(), CHUNK_SIZE)
             if not chunk:
-                break
+                empty_retries += 1
+                if empty_retries >= MAX_EMPTY_RETRIES:
+                    break
+                continue
+            empty_retries = 0
 
             self.buffer += chunk
-            while b"\n" in self.buffer:
-                line, self.buffer = self.buffer.split(b"\n", 1)
-                line = line.strip()
-                if not line:
-                    continue
-
-                self.raw_log_file.write(line.decode(errors="replace") + "\n")
-                self.raw_log_file.flush()
-
-                try:
-                    response = json.loads(line)
-                    if response.get("id") == message_id:
-                        return response
-                except json.JSONDecodeError:
-                    pass
+            for _, msg in self._parse_buffer():
+                if msg.get("id") == message_id:
+                    return msg
         return None
-
-    def _read_available_messages(self) -> list[dict]:
-        """
-        Read all available messages from stdout without blocking.
-
-        Returns:
-            List of parsed JSON objects.
-        """
-        messages = []
-        while True:
-            ready, _, _ = select.select([self.process.stdout], [], [], 0.1)
-            if not ready:
-                break
-
-            chunk = os.read(self.process.stdout.fileno(), CHUNK_SIZE)
-            if not chunk:
-                break
-
-            self.buffer += chunk
-            while b"\n" in self.buffer:
-                line, self.buffer = self.buffer.split(b"\n", 1)
-                line = line.strip()
-                if not line:
-                    continue
-
-                self.raw_log_file.write(line.decode(errors="replace") + "\n")
-                self.raw_log_file.flush()
-
-                try:
-                    messages.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
-        return messages
 
     def _start_process(self) -> None:
         """Start the opencode subprocess."""
@@ -356,34 +403,42 @@ class ACPClient:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            bufsize=0,
         )
+        self._stderr_done.clear()
+        self._stderr_thread = threading.Thread(target=self._stderr_reader, daemon=True)
+        self._stderr_thread.start()
 
     def _initialize(self) -> None:
-        """Initialize the ACP connection."""
-        self._send_message(
-            "initialize",
-            {
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION}
-            }
-        )
-        response = self._wait_for_response(1, INITIALIZATION_TIMEOUT)
-        if not response:
-            cleanup_process(self.process)
-            print(json.dumps({
-                "status": STATUS_ERROR,
-                "error": "initialize failed: no response from server"
-            }))
-            sys.exit(1)
+        """Initialize the ACP connection with retry logic."""
+        last_error = None
+        for attempt in range(MAX_RETRIES):
+            self._send_message(
+                "initialize",
+                {
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION}
+                }
+            )
+            response = self._wait_for_response(self.message_id, INITIALIZATION_TIMEOUT)
+            if response:
+                if "error" in response:
+                    last_error = response["error"]
+                else:
+                    return
+            else:
+                last_error = "no response from server"
 
-        if "error" in response:
-            cleanup_process(self.process)
-            print(json.dumps({
-                "status": STATUS_ERROR,
-                "error": f"initialize failed: {response['error']}"
-            }))
-            sys.exit(1)
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_BASE_DELAY * (attempt + 1))
+
+        cleanup_process(self.process)
+        print(json.dumps({
+            "status": STATUS_ERROR,
+            "error": f"initialize failed: {last_error}"
+        }))
+        sys.exit(1)
 
     def _load_or_create_session(self) -> str:
         """
@@ -397,65 +452,105 @@ class ACPClient:
         return self._create_session()
 
     def _load_session(self) -> str:
-        """Load an existing session by ID."""
-        self._send_message(
-            "session/load",
-            {
-                "sessionId": self.args.session_id,
-                "cwd": self.args.cwd,
-                "mcpServers": []
-            }
-        )
-        response = self._wait_for_response(2, SESSION_TIMEOUT)
-        if not response or "error" in response:
-            cleanup_process(self.process)
-            print(json.dumps({
-                "status": STATUS_ERROR,
-                "error": f"session/load failed: {response}"
-            }))
-            sys.exit(1)
-        return response["result"]["sessionId"]
+        """Load an existing session by ID with retry logic."""
+        last_error = None
+        for attempt in range(MAX_RETRIES):
+            self._send_message(
+                "session/load",
+                {
+                    "sessionId": self.args.session_id,
+                    "cwd": self.args.cwd,
+                    "mcpServers": []
+                }
+            )
+            response = self._wait_for_response(self.message_id, SESSION_TIMEOUT)
+            if response and "error" not in response:
+                result = response.get("result")
+                if result and "sessionId" in result:
+                    return result["sessionId"]
+                last_error = f"invalid response structure: {response}"
+            else:
+                last_error = str(response) if response else "no response"
+
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_BASE_DELAY * (attempt + 1))
+
+        cleanup_process(self.process)
+        print(json.dumps({
+            "status": STATUS_ERROR,
+            "error": f"session/load failed: {last_error}"
+        }))
+        sys.exit(1)
 
     def _create_session(self) -> str:
-        """Create a new session."""
-        self._send_message(
-            "session/new",
-            {"cwd": self.args.cwd, "mcpServers": []}
-        )
-        response = self._wait_for_response(2, PROMPT_TIMEOUT)
-        if not response or "error" in response:
-            cleanup_process(self.process)
-            print(json.dumps({
-                "status": STATUS_ERROR,
-                "error": f"session/new failed: {response}"
-            }))
-            sys.exit(1)
-
-        session_id = response["result"]["sessionId"]
-
-        if self.args.mode != MODE_BUILD:
+        """Create a new session with retry logic."""
+        last_error = None
+        for attempt in range(MAX_RETRIES):
             self._send_message(
-                "session/set_mode",
-                {"sessionId": session_id, "modeId": self.args.mode}
+                "session/new",
+                {"cwd": self.args.cwd, "mcpServers": []}
             )
-            self._wait_for_response(3, PROMPT_TIMEOUT)
+            response = self._wait_for_response(self.message_id, SESSION_TIMEOUT)
+            if response and "error" not in response:
+                result = response.get("result")
+                if result and "sessionId" in result:
+                    session_id = result["sessionId"]
 
-        return session_id
+                    if self.args.mode != MODE_BUILD:
+                        self._send_message(
+                            "session/set_mode",
+                            {"sessionId": session_id, "modeId": self.args.mode}
+                        )
+                        self._wait_for_response(self.message_id, PROMPT_TIMEOUT)
+
+                    return session_id
+                last_error = f"invalid response structure: {response}"
+            else:
+                last_error = str(response) if response else "no response"
+
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_BASE_DELAY * (attempt + 1))
+
+        cleanup_process(self.process)
+        print(json.dumps({
+            "status": STATUS_ERROR,
+            "error": f"session/new failed: {last_error}"
+        }))
+        sys.exit(1)
 
     def _submit_prompt(self) -> int:
         """
-        Submit the task prompt.
+        Submit the task prompt with retry logic.
 
         Returns:
             The message ID of the prompt request.
         """
-        return self._send_message(
-            "session/prompt",
-            {
-                "sessionId": self.session_id,
-                "prompt": [{"type": "text", "text": self.args.task}]
-            }
-        )
+        last_error = None
+        for attempt in range(MAX_RETRIES):
+            msg_id = self._send_message(
+                "session/prompt",
+                {
+                    "sessionId": self.session_id,
+                    "prompt": [{"type": "text", "text": self.args.task}]
+                }
+            )
+            response = self._wait_for_response(msg_id, PROMPT_TIMEOUT)
+            if response:
+                if "error" not in response:
+                    return msg_id
+                last_error = response["error"]
+            else:
+                last_error = "no response"
+
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_BASE_DELAY * (attempt + 1))
+
+        cleanup_process(self.process)
+        print(json.dumps({
+            "status": STATUS_ERROR,
+            "error": f"session/prompt failed: {last_error}"
+        }))
+        sys.exit(1)
 
     def _process_update(self, update_type: str, update_data: dict) -> bool:
         """
@@ -566,20 +661,14 @@ class ACPClient:
             return True
 
         chosen_option = determine_auto_approve(tool_kind, options, self.args.approve)
-        self.message_id += 1
-
-        response_message = {
-            "jsonrpc": "2.0",
-            "id": self.message_id,
-            "method": "session/permission_response",
-            "params": {
+        self._send_message(
+            "session/permission_response",
+            {
                 "sessionId": self.session_id,
                 "toolCallId": tool_call_id,
                 "optionId": chosen_option
             }
-        }
-        self.process.stdin.write((json.dumps(response_message) + "\n").encode())
-        self.process.stdin.flush()
+        )
         return False
 
     def _process_response(self, result: dict) -> bool:
@@ -646,25 +735,17 @@ class ACPClient:
 
             chunk = os.read(self.process.stdout.fileno(), CHUNK_SIZE)
             if not chunk:
-                break
+                continue
 
             self.buffer += chunk
-            while b"\n" in self.buffer:
-                line, self.buffer = self.buffer.split(b"\n", 1)
-                line = line.strip()
-                if not line:
-                    continue
 
-                self.raw_log_file.write(line.decode(errors="replace") + "\n")
+            for raw_line, message in self._parse_buffer():
+                self.raw_log_file.write(raw_line.decode(errors="replace") + "\n")
                 self.raw_log_file.flush()
-
-                try:
-                    message = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
 
                 if message.get("method") == "session/request_permission":
                     if self._handle_permission_request(message.get("params", {})):
+                        self._stderr_done.set()
                         return
                     continue
 
@@ -680,6 +761,9 @@ class ACPClient:
                 self._process_update(update_type, update_data)
 
         self._drain_output()
+        self._stderr_done.set()
+        if self._stderr_thread:
+            self._stderr_thread.join(timeout=2)
         cleanup_process(self.process)
         self.raw_log_file.close()
 
