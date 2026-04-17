@@ -43,6 +43,7 @@ SESSION_TIMEOUT = 30
 PROMPT_TIMEOUT = 10
 DRAIN_WAIT_TIME = 0.3
 DRAIN_ITERATIONS = 5
+DRAIN_TIMEOUT = 10
 TERMINATE_TIMEOUT = 5
 MAX_BUFFER_SIZE = 10 * 1024 * 1024
 MAX_EMPTY_RETRIES = 5
@@ -352,7 +353,11 @@ class ACPClient:
 
             if len(self.buffer) > MAX_BUFFER_SIZE:
                 sys.stderr.write(f"Buffer exceeded max size, truncating\n")
-                self.buffer = self.buffer[-CHUNK_SIZE:]
+                last_newline = self.buffer.rfind(b"\n", -CHUNK_SIZE)
+                if last_newline != -1:
+                    self.buffer = self.buffer[last_newline:]
+                else:
+                    self.buffer = self.buffer[-CHUNK_SIZE:]
 
             try:
                 msg = json.loads(line)
@@ -692,10 +697,11 @@ class ACPClient:
         return True
 
     def _drain_output(self) -> None:
-        """Drain any remaining output from the process."""
-        time.sleep(DRAIN_WAIT_TIME)
+        """Drain any remaining output from the process, parsing and processing updates."""
+        deadline = time.time() + DRAIN_TIMEOUT
         for _ in range(DRAIN_ITERATIONS):
-            ready, _, _ = select.select([self.process.stdout.fileno()], [], [], DRAIN_WAIT_TIME)
+            remaining = max(0.1, deadline - time.time())
+            ready, _, _ = select.select([self.process.stdout.fileno()], [], [], remaining)
             if not ready:
                 break
 
@@ -703,9 +709,20 @@ class ACPClient:
             if not chunk:
                 break
 
-            for line in chunk.split(b"\n"):
-                if line.strip():
-                    self.raw_log_file.write(line.decode(errors="replace") + "\n")
+            self.buffer += chunk
+
+            for raw_line, message in self._parse_buffer():
+                self.raw_log_file.write(raw_line.decode(errors="replace") + "\n")
+                self.raw_log_file.flush()
+
+                if message.get("method") == "session/request_permission":
+                    self._handle_permission_request(message.get("params", {}))
+                    continue
+
+                params = message.get("params", {})
+                update_type = params.get("update", {}).get("sessionUpdate", "")
+                update_data = params.get("update", {})
+                self._process_update(update_type, update_data)
 
     def run(self) -> None:
         """Run the ACP client main loop."""
@@ -755,6 +772,20 @@ class ACPClient:
                     if "result" in message:
                         self._process_response(message["result"])
                         got_response = True
+                    continue
+
+                params = message.get("params", {})
+                update_type = params.get("update", {}).get("sessionUpdate", "")
+                update_data = params.get("update", {})
+                self._process_update(update_type, update_data)
+
+        if got_response and self.buffer:
+            for raw_line, message in self._parse_buffer():
+                self.raw_log_file.write(raw_line.decode(errors="replace") + "\n")
+                self.raw_log_file.flush()
+
+                if message.get("method") == "session/request_permission":
+                    self._handle_permission_request(message.get("params", {}))
                     continue
 
                 params = message.get("params", {})
